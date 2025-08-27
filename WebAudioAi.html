@@ -1,0 +1,422 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Live Caption + Translate + Replies (AudioWorklet + VAD + Stable Replies)</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; background:#0e0f13; color:#fff; margin:0; }
+    .wrap { max-width: 1000px; margin: 24px auto; padding: 0 16px; }
+    header { display:flex; gap:8px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+    input, button, select, label { padding:8px 10px; border-radius:10px; border:1px solid #2a2d36; background:#151823; color:#fff; }
+    button { cursor:pointer; }
+    .row { display:flex; gap:12px; align-items:center; flex-wrap: wrap; }
+    .pill { background:#151823; padding:6px 10px; border-radius:999px; border:1px solid #2a2d36; }
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+    .card { background:#11141d; border:1px solid #262a35; border-radius:14px; padding:12px; }
+    .muted { opacity:.7 }
+    .sugg button { width:100%; text-align:left; margin:6px 0; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .inline { display:inline-flex; align-items:center; gap:8px; }
+    .cb { transform: scale(1.1); margin-right:6px; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <strong>OpenAI API Key:</strong>
+    <input id="key" type="password" placeholder="sk-..." size="36" />
+    <select id="sttModel" title="STT Model">
+      <option value="whisper-1">whisper-1</option>
+      <option value="gpt-4o-mini-transcribe">gpt-4o-mini-transcribe</option>
+    </select>
+    <select id="llmModel" title="LLM Model">
+      <option value="gpt-4o-mini">gpt-4o-mini</option>
+      <option value="gpt-4o">gpt-4o</option>
+    </select>
+    <button id="startBtn">▶ Start</button>
+    <button id="stopBtn" disabled>■ Stop</button>
+    <span id="status" class="pill muted">idle</span>
+  </header>
+
+  <div class="row">
+    <label class="pill">Arah Terjemah:
+      <select id="dir">
+        <option value="en->id">EN → ID (client → kamu)</option>
+        <option value="id->en">ID → EN (kamu → client)</option>
+      </select>
+    </label>
+
+    <label class="pill">Bahasa STT:
+      <select id="sttLang">
+        <option value="auto" selected>Auto</option>
+        <option value="en">English</option>
+        <option value="id">Indonesian</option>
+      </select>
+    </label>
+
+    <label class="pill">Timeslice (ms):
+      <select id="timeslice">
+        <option>3000</option>
+        <option selected>5000</option>
+        <option>8000</option>
+      </select>
+    </label>
+
+    <label class="pill inline" title="Saat ON: saran 'terkunci' sampai terdeteksi pertanyaan/ucapan baru">
+      <input type="checkbox" id="lockToggle" class="cb" checked />
+      Lock per-pertanyaan
+    </label>
+  </div>
+
+  <div class="grid" style="margin-top:12px;">
+    <div class="card">
+      <h3>📝 Caption (asli)</h3>
+      <div id="caption" class="mono"></div>
+    </div>
+    <div class="card">
+      <h3>🌍 Terjemahan</h3>
+      <div id="translation" class="mono"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px;">
+    <h3>⚡ Suggested Replies</h3>
+    <div id="suggs" class="sugg"></div>
+  </div>
+
+  <div class="card" style="margin-top:12px;">
+    <h3>Debug</h3>
+    <pre id="log" class="mono muted" style="white-space:pre-wrap; max-height:280px; overflow:auto;"></pre>
+  </div>
+</div>
+
+<script>
+/* ============ Helpers ============ */
+const $ = (id) => document.getElementById(id);
+const log = (m) => { const el = $("log"); el.textContent += m + "\\n"; el.scrollTop = el.scrollHeight; };
+function setStatus(t) { $("status").textContent = t; }
+function apiKey() { return $("key").value.trim(); }
+function headersJSON() { return { "Content-Type": "application/json", "Authorization": "Bearer " + apiKey() }; }
+
+/* ============ AudioWorklet capture ============ */
+let running = false;
+let ctx, source, workletNode, stream, pullTimer;
+let pcmBuffer = [];               // frame Float32Array
+let srcSampleRate = 48000;        // update saat AudioContext dibuat
+let bufferText = "";              // buffer untuk konteks (ID/EN tergantung arah)
+let vadHangMs = 600;              // tahan sedikit setelah suara berhenti
+let vadSilenceMs = 0;
+
+const workletCode = `
+class PCMProcessor extends AudioWorkletProcessor {
+  process (inputs) {
+    const input = inputs[0];
+    if (input && input[0]) this.port.postMessage(input[0]);
+    return true;
+  }
+}
+registerProcessor('pcm-proc', PCMProcessor);
+`;
+const workletURL = URL.createObjectURL(new Blob([workletCode], {type:'text/javascript'}));
+
+/* ============ Audio util ============ */
+function resampleFloat32(src, srcRate, dstRate) {
+  if (srcRate === dstRate) return src;
+  const ratio = srcRate / dstRate;
+  const len = Math.floor(src.length / ratio);
+  const out = new Float32Array(len);
+  for (let i=0;i<len;i++) {
+    const idx = i * ratio;
+    const i0 = Math.floor(idx), i1 = Math.min(i0+1, src.length-1);
+    out[i] = src[i0] + (src[i1] - src[i0]) * (idx - i0);
+  }
+  return out;
+}
+function encodeWavPCM16(float32, sampleRate=16000) {
+  const bytesPerSample=2, ch=1, dataSize=float32.length*bytesPerSample;
+  const buffer=new ArrayBuffer(44+dataSize), view=new DataView(buffer);
+  const w=(o,s)=>{ for(let i=0;i<s.length;i++) view.setUint8(o+i,s.charCodeAt(i)); };
+  w(0,'RIFF'); view.setUint32(4,36+dataSize,true); w(8,'WAVE'); w(12,'fmt ');
+  view.setUint32(16,16,true); view.setUint16(20,1,true); view.setUint16(22,ch,true);
+  view.setUint32(24,sampleRate,true); view.setUint32(28,sampleRate*ch*bytesPerSample,true);
+  view.setUint16(32,ch*bytesPerSample,true); view.setUint16(34,16,true); w(36,'data');
+  view.setUint32(40,dataSize,true);
+  let off=44; for (let i=0;i<float32.length;i++,off+=2) {
+    const s=Math.max(-1,Math.min(1,float32[i])); view.setInt16(off, s<0?s*0x8000:s*0x7fff, true);
+  }
+  return new Blob([view], {type:'audio/wav'});
+}
+function concatFloat32(chunks){ const tot=chunks.reduce((a,c)=>a+c.length,0); const out=new Float32Array(tot); let off=0; for(const c of chunks){ out.set(c,off); off+=c.length; } return out; }
+function rms(arr){ let s=0; for(let i=0;i<arr.length;i++){ const v=arr[i]; s+=v*v; } return Math.sqrt(s/Math.max(1,arr.length)); }
+
+/* ============ Start/Stop ============ */
+$("startBtn").onclick = async () => {
+  if (!apiKey()) { alert("Isi OpenAI API key dulu ya."); return; }
+  try {
+    setStatus("requesting …");
+    stream = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:true });
+    const a = stream.getAudioTracks()[0];
+    if (!a) throw new Error("Tidak ada audio track. Centang 'Share tab/system audio' & pastikan sumber berbunyi.");
+    if (a.readyState !== "live") throw new Error("Audio track not live.");
+
+    ctx = new (window.AudioContext||window.webkitAudioContext)();
+    srcSampleRate = ctx.sampleRate;
+    source = ctx.createMediaStreamSource(new MediaStream([a]));
+    await ctx.audioWorklet.addModule(workletURL);
+    workletNode = new AudioWorkletNode(ctx, 'pcm-proc');
+    workletNode.port.onmessage = (ev) => { pcmBuffer.push(ev.data); };
+
+    source.connect(workletNode); // tidak ke destination agar tak echo
+
+    running = true;
+    $("startBtn").disabled = true; $("stopBtn").disabled = false;
+    setStatus("recording…");
+    log("AudioWorklet started. sampleRate=" + srcSampleRate);
+
+    const ts = parseInt($("timeslice").value,10) || 5000;
+    pullTimer = setInterval(flushAndSend, ts);
+  } catch (e) {
+    console.error(e);
+    log("start error -> " + (e.name||"") + ": " + (e.message||e));
+    alert("Gagal mulai capture. Detail: " + (e.message||e));
+    setStatus("error");
+  }
+};
+
+$("stopBtn").onclick = () => {
+  running = false;
+  $("startBtn").disabled = false; $("stopBtn").disabled = true;
+  if (pullTimer) { clearInterval(pullTimer); pullTimer = null; }
+  try { workletNode?.disconnect(); source?.disconnect(); ctx?.close(); } catch{}
+  if (stream) stream.getTracks().forEach(t=>t.stop());
+  setStatus("stopped");
+};
+
+/* ============ Flush → VAD → WAV → Pipeline ============ */
+async function flushAndSend() {
+  if (!running) return;
+  const frames = pcmBuffer.splice(0, pcmBuffer.length);
+  if (!frames.length) { log("no audio frames, skip"); return; }
+
+  // Gabung untuk analisis VAD
+  const pcm = concatFloat32(frames);
+  const energy = rms(pcm);
+  const ms = Math.round((pcm.length / srcSampleRate) * 1000);
+  const VAD_THRESHOLD = 0.01; // sesuaikan: 0.008–0.015
+  if (energy < VAD_THRESHOLD) {
+    vadSilenceMs += ms;
+    log(`silence ${ms}ms (rms=${energy.toFixed(4)})`);
+    return; // Jangan kirim senyap
+  } else {
+    // reset silence (ada suara)
+    vadSilenceMs = 0;
+  }
+
+  // resample → 16k + kirim
+  const pcm16k = resampleFloat32(pcm, srcSampleRate, 16000);
+  const wavBlob = encodeWavPCM16(pcm16k, 16000);
+  await handleChunk(wavBlob);
+}
+
+async function handleChunk(wavBlob) {
+  setStatus("uploading…");
+  const sttText = await transcribeChunk(wavBlob);
+  if (!sttText) { setStatus("recording…"); return; }
+
+  $("caption").textContent += (sttText + " ");
+
+  const dir = $("dir").value;
+  const translated = await translateText(sttText, dir);
+  if (translated) $("translation").textContent += (translated + " ");
+
+  // buffer konteks (pakai bahasa yg kamu baca)
+  bufferText = (bufferText + " " + (dir === "en->id" ? sttText : translated)).slice(-3000);
+
+  const lastUtter = extractLastUtterance(dir === "en->id" ? sttText : translated);
+  if (shouldGenerateReplies(lastUtter)) {
+    const suggs = await suggestReplies(bufferText, lastUtter);
+    renderSuggestions(suggs);
+  }
+  setStatus("recording…");
+}
+
+/* ============ OpenAI: STT / Translate ============ */
+async function transcribeChunk(wavBlob) {
+  try {
+    if (!wavBlob || wavBlob.size === 0) return "";
+    const fd = new FormData();
+    fd.append("file", new File([wavBlob], "chunk.wav", { type: "audio/wav" }));
+    fd.append("model", $("sttModel").value);
+    // Kunci bahasa jika dipilih
+    const lang = $("sttLang").value;
+    if (lang !== "auto") fd.append("language", lang);
+    // Biar tidak ngawur
+    fd.append("temperature", "0");
+
+    const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST", headers: { "Authorization": "Bearer " + apiKey() }, body: fd
+    });
+    const data = await resp.json();
+    if (!resp.ok) { log("STT fail: " + JSON.stringify(data)); return ""; }
+    const text = (data.text || "").trim();
+    if (text) log("STT: " + text);
+    return text;
+  } catch (err) { log("STT error: " + (err?.message || err)); return ""; }
+}
+
+async function translateText(text, dir) {
+  try {
+    if (!text) return "";
+    const [src, dst] = dir.split("->");
+    const prompt = `Translate the following text from ${src.toUpperCase()} to ${dst.toUpperCase()}.
+Only return the translation without extra explanation.
+
+Text:
+${text}`;
+    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST", headers: headersJSON(),
+      body: JSON.stringify({
+        model: $("llmModel").value,
+        temperature: 0.2,
+        seed: 7,
+        messages: [
+          { role: "system", content: "You are a precise, low-latency translator." },
+          { role: "user", content: prompt }
+        ]
+      })
+    });
+    const data = await resp.json();
+    if (!resp.ok) { log("Translate fail: " + JSON.stringify(data)); return ""; }
+    const out = data.choices?.[0]?.message?.content?.trim() || "";
+    if (out) log("TL: " + out);
+    return out;
+  } catch (err) { log("Translate error: " + (err?.message || err)); return ""; }
+}
+
+/* ============ Stable, context-aware replies ============ */
+let lastQuestionKey = "";
+let lastPromptKey   = "";
+let lastReplies     = [];
+const replyCache = new Map();
+
+function normalizeKey(s){
+  const text = (s || "").toLowerCase();
+  try {
+    return text
+      .replace(/[^\p{L}\p{N}\s?.!]/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .split(' ')
+      .slice(-20)
+      .join(' ');
+  } catch {
+    return text
+      .replace(/[^A-Za-z0-9\s?.!]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .split(' ')
+      .slice(-20)
+      .join(' ');
+  }
+}
+function extractLastUtterance(newText){
+  const parts = newText.split(/(?<=[\.\?\!])\s+/);
+  const last = parts[parts.length-1] || newText;
+  return last.trim();
+}
+function shouldGenerateReplies(lastUtter){
+  const lock = $("lockToggle").checked;
+  const hasQuestion = /[\?]|(could|can|would|should|do you|are you|when|where|how|what|why)\b/i.test(lastUtter);
+  const keyQ = normalizeKey(lastUtter);
+  if (lock) {
+    if (!hasQuestion && !/[\.!\?]$/.test(lastUtter)) return false;
+    if (keyQ && keyQ !== lastQuestionKey) { lastQuestionKey = keyQ; return true; }
+    return false;
+  } else {
+    const ctxKey = normalizeKey(bufferText);
+    if (ctxKey !== lastPromptKey) { lastPromptKey = ctxKey; return true; }
+    return false;
+  }
+}
+
+// validator kecil: pastikan field "id" benar2 Bahasa Indonesia, kalau bukan → terjemahkan dari EN ke ID
+async function enforceIndonesian(list){
+  const looksIndo = (s) => /(?: yang | dan | tidak | akan | sudah | bisa | kami | Anda | kita )/i.test(s);
+  const fixed = [];
+  for (const item of list) {
+    let en = item.en || "";
+    let id = item.id || "";
+    if (!looksIndo(id)) {
+      // terjemahkan dari en ke id
+      id = await translateText(en, "en->id");
+    }
+    fixed.push({en, id});
+  }
+  return fixed;
+}
+
+async function suggestReplies(context, lastUtter) {
+  const key = $("lockToggle").checked ? normalizeKey(lastUtter) : normalizeKey(context);
+  if (replyCache.has(key)) return replyCache.get(key);
+
+  try {
+    const prompt = `
+You are assisting in a live business meeting. Generate THREE options that directly respond to the client's LAST STATEMENT below.
+Rules:
+- Reply 1: FORMAL & directly answers the last question/request.
+- Reply 2: ACTION-ORIENTED next step (proposal with concrete step, owner or time placeholder).
+- Reply 3: CLARIFYING question ONLY IF essential info is missing; otherwise a concise supportive alternative.
+- Use facts/terms from CONTEXT consistently (names, company, product).
+- No greetings unless the client greets first. No fluff. Max 2 sentences per option.
+- Output strict JSON array: [{ "en": "...", "id": "..." }] with exactly 3 items. "id" must be Bahasa Indonesia (not Malay, Polish, etc).
+
+CONTEXT:
+${context.slice(-1200)}
+
+LAST STATEMENT (focus on answering this):
+${lastUtter}
+`;
+    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST", headers: headersJSON(),
+      body: JSON.stringify({
+        model: $("llmModel").value,
+        temperature: 0.2,
+        top_p: 0.95,
+        seed: 7,
+        messages: [
+          { role: "system", content: "You craft precise, context-aware business replies that directly answer the client. Always output Indonesian in the 'id' field." },
+          { role: "user", content: prompt }
+        ]
+      })
+    });
+    const data = await resp.json();
+    if (!resp.ok) { log("Suggest fail: " + JSON.stringify(data)); return lastReplies || []; }
+    const raw = (data.choices?.[0]?.message?.content || "[]").trim();
+    const arr = JSON.parse(extractJSON(raw));
+    let replies = Array.isArray(arr) ? arr.slice(0,3) : [];
+
+    // perkuat: paksa "id" benar2 Bahasa Indonesia
+    replies = await enforceIndonesian(replies);
+
+    replyCache.set(key, replies);
+    lastReplies = replies;
+    return replies;
+  } catch (err) {
+    log("Suggest error: " + (err?.message || err));
+    return lastReplies || [];
+  }
+}
+
+function extractJSON(s){ const i=s.indexOf('['), j=s.lastIndexOf(']'); return (i>=0&&j>=i)?s.slice(i,j+1):'[]'; }
+function renderSuggestions(list){
+  const box=$("suggs"); box.innerHTML="";
+  (list||[]).forEach((o,idx)=>{
+    const btn=document.createElement("button");
+    btn.innerHTML=`💬 <b>${o.en||""}</b><br><span class="muted">${o.id||""}</span>`;
+    btn.onclick=()=>{ navigator.clipboard.writeText(`${o.en}\n\n(ID) ${o.id}`); log("Copied reply #"+(idx+1)); };
+    box.appendChild(btn);
+  });
+}
+</script>
+</body>
+</html>
